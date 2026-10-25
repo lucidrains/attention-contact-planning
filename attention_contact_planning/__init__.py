@@ -1,0 +1,1 @@
+from attention_contact_planning.attention_contact_planning import AttnContact

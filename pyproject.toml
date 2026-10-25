@@ -1,0 +1,51 @@
+[project]
+name = "attention-contact-planning"
+version = "0.0.1"
+description = "Attention-based Contact Planning"
+authors = [
+    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">= 3.9"
+license = { file = "LICENSE" }
+keywords = [
+    'artificial intelligence',
+    'deep learning',
+    'humanoid locomotion',
+    'contact planning',
+    'attention mechanism'
+  ]
+classifiers=[
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python :: 3.9',
+  ]
+
+dependencies = [
+    'einops>=0.8.0',
+    'torch>=2.0',
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/attention-contact-planning/"
+Repository = "https://github.com/lucidrains/attention-contact-planning"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build]
+include = [
+    "attention_contact_planning",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["attention_contact_planning"]
