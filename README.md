@@ -1,6 +1,6 @@
 ## Attention Contact Planning (wip)
 
-Implementation of <a href="https://arxiv.org/abs/2610.31608">Humanoid Mobility via Attention-based Contacts</a> (<a href="https://leggedrobotics.github.io/ACP/">project page</a>), out of ETH Zürich
+Implementation of <a href="https://leggedrobotics.github.io/ACP/">Humanoid Mobility via Attention-based Contacts</a> (<a href="https://arxiv.org/abs/2610.31608">paper</a>), out of ETH Zürich
 
 ## Citations
 
