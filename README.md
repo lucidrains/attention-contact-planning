@@ -13,4 +13,11 @@ Implementation of <a href="https://leggedrobotics.github.io/ACP/">Humanoid Mobil
     journal = {arXiv preprint arXiv:2610.31608},
     year    = {2026}
 }
+
+@article{shazeer2020talkingheads,
+    title   = {Talking-Heads Attention},
+    author  = {Shazeer, Noam and Lan, Zhenzhong and Cheng, Youlong and Ding, Nan and Hou, Le},
+    journal = {arXiv preprint arXiv:2003.02436},
+    year    = {2020}
+}
 ```

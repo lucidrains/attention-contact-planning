@@ -3,12 +3,17 @@ import torch
 
 from attention_contact_planning import (
     AttentionContactPlanning,
-    SelfAttention,
+    CrossAttention,
     TerrainContactPlanner,
     TerrainEncoder,
     contact_probs_loss,
-    no_contact_target_from_soft_targets,
     occupancy_loss,
+)
+from attention_contact_planning.attention_contact_planning import (
+    SelfAttention,
+    TalkingHeads,
+    exists,
+    no_contact_target_from_soft_targets,
 )
 
 
@@ -108,6 +113,60 @@ def test_self_attention_is_prenormed_with_residual():
             self_ff.fn.net[-2].bias.zero_()
 
     assert torch.allclose(attn(x), x)
+
+
+def test_talking_heads_residual_conv_mlp():
+    torch.manual_seed(0)
+
+    heads = 4
+    talking_heads = TalkingHeads(heads = heads, hidden_dim = 2)
+    attn_logits = torch.randn(2, heads, 3, 5)
+
+    assert isinstance(talking_heads.net[0], torch.nn.Conv2d)
+    assert isinstance(talking_heads.net[1], torch.nn.ReLU)
+    assert isinstance(talking_heads.net[2], torch.nn.Conv2d)
+
+    # zero initialized output conv makes the branch an identity at init
+
+    assert torch.allclose(talking_heads(attn_logits), attn_logits)
+
+    with torch.no_grad():
+        talking_heads.net[-1].weight.normal_(std = 0.1)
+
+    mixed = talking_heads(attn_logits)
+
+    assert mixed.shape == attn_logits.shape
+    assert not torch.allclose(mixed, attn_logits)
+
+
+@pytest.mark.parametrize('talking_heads', [False, True])
+def test_cross_attention_talking_heads(talking_heads):
+    torch.manual_seed(0)
+
+    cross_attn = CrossAttention(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        point_dim = 16,
+        talking_heads = talking_heads,
+        talking_heads_hidden_dim = 2
+    )
+
+    assert exists(cross_attn.talking_heads) == talking_heads
+
+    out = cross_attn(
+        torch.randn(2, 9, 16),
+        torch.randn(2, 20, 16),
+        point_features = True
+    )
+
+    assert out.attn_logits.shape == (2, 4, 9, 21)
+    assert torch.allclose(out.contact_probs, out.attn_logits.softmax(dim = -1))
+
+    out.attn_logits.mean().backward()
+
+    if talking_heads:
+        assert any(exists(param.grad) for param in cross_attn.talking_heads.parameters())
 
 
 def test_self_attention_mask_ignores_masked_tokens():
@@ -284,6 +343,49 @@ def test_occupancy_head_faithful_to_paper():
     assert planner.body_embed.grad is not None
 
 
+def test_optional_occupancy_loss_from_labels():
+    torch.manual_seed(0)
+
+    b, n, dim, context_dim, num_bodies = 2, 20, 16, 8, 9
+
+    planner = make_planner(occupancy_from_attention = False)
+
+    context = torch.randn(b, dim)
+    occupancy_context = torch.randn(b, context_dim)
+    points = torch.randn(b, n, dim)
+
+    out = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = occupancy_context
+    )
+    assert not exists(out.occupancy_loss)
+
+    targets = torch.randint(0, 2, (b, num_bodies))
+    body_mask = torch.tensor([
+        [True] * 9,
+        [True] * 4 + [False] * 5
+    ])
+
+    out = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = occupancy_context,
+        occupancy_targets = targets,
+        body_mask = body_mask
+    )
+
+    expected = occupancy_loss(out.occupancy_logits, targets, body_mask)
+
+    assert out.occupancy_loss.ndim == 0
+    assert torch.allclose(out.occupancy_loss, expected)
+
+    out.occupancy_loss.backward()
+    assert any(exists(param.grad) for param in planner.occupancy_predictor.parameters())
+
+
 def test_occupancy_derived_from_cross_attention():
     torch.manual_seed(0)
 
@@ -414,3 +516,55 @@ def test_terrain_planner_occupancy(occupancy_from_attention):
 
     out.occupancy_logits.mean().backward()
     assert planner.terrain_encoder.convs[0].conv.weight.grad is not None
+
+
+def test_terrain_planner_optional_occupancy_loss_from_labels():
+    torch.manual_seed(0)
+
+    b, t, h, w = 2, 2, 3, 4
+    n, num_bodies = h * w, 9
+
+    terrain_encoder = TerrainEncoder(dim = 16, context_dim = 8, channels = (4,))
+
+    planner = TerrainContactPlanner(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        terrain_encoder = terrain_encoder,
+        proprio_dim = 10,
+        goal_dim = 3,
+        occupancy_hidden_dims = (16,)
+    )
+
+    height = torch.randn(b, t, h, w)
+    points = torch.randn(b, t, n, 3)
+    proprio = torch.randn(b, t, 10)
+    goal = torch.randn(b, t, 3)
+
+    out = planner(height, points, proprio, goal)
+    assert not exists(out.occupancy_loss)
+
+    targets = torch.randint(0, 2, (b, t, num_bodies))
+    body_mask = torch.ones(b, t, num_bodies, dtype = torch.bool)
+    body_mask[:, :, 5:] = False
+
+    out = planner(
+        height,
+        points,
+        proprio,
+        goal,
+        occupancy_targets = targets,
+        body_mask = body_mask
+    )
+
+    expected = occupancy_loss(
+        out.occupancy_logits.reshape(b * t, num_bodies),
+        targets.reshape(b * t, num_bodies),
+        body_mask.reshape(b * t, num_bodies)
+    )
+
+    assert out.occupancy_loss.ndim == 0
+    assert torch.allclose(out.occupancy_loss, expected)
+
+    out.occupancy_loss.backward()
+    assert exists(planner.terrain_encoder.convs[0].conv.weight.grad)

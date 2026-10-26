@@ -25,6 +25,7 @@ from torch import Tensor, nn
 from torch.nn import Module
 from torch.nn import functional as F
 from torch_einops_utils import masked_mean
+from torch_einops_utils.stable_softmax import binary_cross_entropy_with_logits
 from x_mlps_pytorch import MLP
 
 # named tuples
@@ -45,7 +46,8 @@ AttentionContactPlanningReturn = namedtuple('AttentionContactPlanningReturn', [
     'attn_logits',
     'contact_probs',
     'occupancy_logits',
-    'occupancy_probs'
+    'occupancy_probs',
+    'occupancy_loss'
 ])
 
 TerrainContactPlannerReturn = namedtuple('TerrainContactPlannerReturn', [
@@ -55,7 +57,8 @@ TerrainContactPlannerReturn = namedtuple('TerrainContactPlannerReturn', [
     'occupancy_logits',
     'occupancy_probs',
     'terrain_tokens',
-    'terrain_context'
+    'terrain_context',
+    'occupancy_loss'
 ])
 
 # helpers
@@ -133,9 +136,9 @@ def occupancy_loss(
     occupancy_targets: Tensor,  # b i
     body_mask: Tensor | None = None
 ) -> Tensor:
-    loss = F.binary_cross_entropy_with_logits(
+    loss = binary_cross_entropy_with_logits(
         occupancy_logits,
-        occupancy_targets.float(),
+        occupancy_targets,
         reduction = 'none'
     )
 
@@ -281,6 +284,25 @@ class SelfAttention(Module):
 
         return x
 
+class TalkingHeads(Module):
+    """small residual mlp over the head axis, from https://arxiv.org/abs/2003.02436"""
+
+    def __init__(
+        self,
+        heads,
+        hidden_dim = 8
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(heads, hidden_dim, 1, bias = False),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, heads, 1, bias = False)
+        )
+        nn.init.zeros_(self.net[-1].weight)
+
+    def forward(self, logits):
+        return self.net(logits) + logits
+
 class CrossAttention(Module):
     def __init__(
         self,
@@ -288,13 +310,17 @@ class CrossAttention(Module):
         heads = 32,
         dim_head = 3,
         point_dim = 3,
-        dropout = 0.
+        dropout = 0.,
+        talking_heads = True,
+        talking_heads_hidden_dim = 8
     ):
         super().__init__()
         inner_dim = heads * dim_head
         self.heads = heads
 
         self.scale = dim_head ** -0.5
+
+        self.talking_heads = TalkingHeads(heads, talking_heads_hidden_dim) if talking_heads else None
 
         self.no_contact_key_value = nn.Parameter(torch.zeros(dim))
 
@@ -335,6 +361,9 @@ class CrossAttention(Module):
         q, k, v = map(self.split_heads, (q, k, v))
 
         attn_logits = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+
+        if exists(self.talking_heads):
+            attn_logits = self.talking_heads(attn_logits)
 
         if exists(point_mask):
             attn_logits = einx.where(
@@ -390,7 +419,9 @@ class AttentionContactPlanning(Module):
         terrain_self_attend_depth = 1,
         occupancy_from_attention = False,
         occupancy_context_dim = None,
-        occupancy_hidden_dims = (512, 512, 512)
+        occupancy_hidden_dims = (512, 512, 512),
+        talking_heads = True,
+        talking_heads_hidden_dim = 8
     ):
         super().__init__()
         self.body_embed = nn.Parameter(torch.randn(num_bodies, dim) * 0.02)
@@ -416,7 +447,15 @@ class AttentionContactPlanning(Module):
             depth = terrain_self_attend_depth,
             dropout = dropout
         ) if terrain_self_attend else None
-        self.cross_attn = CrossAttention(dim, heads, dim_head, point_dim, dropout)
+        self.cross_attn = CrossAttention(
+            dim,
+            heads,
+            dim_head,
+            point_dim,
+            dropout,
+            talking_heads = talking_heads,
+            talking_heads_hidden_dim = talking_heads_hidden_dim
+        )
 
         occupancy_context_dim = occupancy_context_dim if exists(occupancy_context_dim) else dim
 
@@ -432,7 +471,9 @@ class AttentionContactPlanning(Module):
         points: Tensor,                     # b j point_dim | b j d
         point_mask: Tensor | None = None,   # b j
         point_features: bool = False,
-        occupancy_context: Tensor | None = None # b c
+        occupancy_context: Tensor | None = None, # b c
+        occupancy_targets: Tensor | None = None, # b i
+        body_mask: Tensor | None = None # b i
     ) -> AttentionContactPlanningReturn:
         body_embed = repeat(self.body_embed, 'i d -> b i d', b = context.shape[0])
         occupancy_context = occupancy_context if exists(occupancy_context) else context
@@ -467,12 +508,15 @@ class AttentionContactPlanning(Module):
             occupancy_logits = self.occupancy_predictor(out.body_features, occupancy_context)
             occupancy_probs = occupancy_logits.sigmoid()
 
+        loss = occupancy_loss(occupancy_logits, occupancy_targets, body_mask) if exists(occupancy_targets) else None
+
         return AttentionContactPlanningReturn(
             out.body_features,
             out.attn_logits,
             out.contact_probs,
             occupancy_logits,
-            occupancy_probs
+            occupancy_probs,
+            loss
         )
 
 class TerrainContactPlanner(Module):
@@ -492,7 +536,9 @@ class TerrainContactPlanner(Module):
         terrain_self_attend = False,
         terrain_self_attend_depth = 1,
         occupancy_from_attention = False,
-        occupancy_hidden_dims = (512, 512, 512)
+        occupancy_hidden_dims = (512, 512, 512),
+        talking_heads = True,
+        talking_heads_hidden_dim = 8
     ):
         super().__init__()
         self.terrain_encoder = terrain_encoder if exists(terrain_encoder) else TerrainEncoder(dim = dim)
@@ -518,7 +564,9 @@ class TerrainContactPlanner(Module):
             terrain_self_attend_depth = terrain_self_attend_depth,
             occupancy_from_attention = occupancy_from_attention,
             occupancy_context_dim = self.terrain_encoder.context_dim,
-            occupancy_hidden_dims = occupancy_hidden_dims
+            occupancy_hidden_dims = occupancy_hidden_dims,
+            talking_heads = talking_heads,
+            talking_heads_hidden_dim = talking_heads_hidden_dim
         )
 
     def forward(
@@ -527,7 +575,9 @@ class TerrainContactPlanner(Module):
         points: Tensor,                  # b t n 3 | b n 3
         proprio: Tensor,                 # b t d | b d
         goal: Tensor,                    # b t d | b d
-        point_mask: Tensor | None = None # b t n | b n
+        point_mask: Tensor | None = None, # b t n | b n
+        occupancy_targets: Tensor | None = None, # b t i | b i
+        body_mask: Tensor | None = None # b t i | b i
     ) -> TerrainContactPlannerReturn:
         if proprio.ndim == 2:
             proprio = rearrange(proprio, 'b d -> b 1 d')
@@ -554,12 +604,28 @@ class TerrainContactPlanner(Module):
 
             point_mask = rearrange(point_mask, 'b t n -> (b t) n')
 
+        if exists(occupancy_targets):
+            if occupancy_targets.ndim == 2:
+                occupancy_targets = repeat(occupancy_targets, 'b i -> b t i', t = t)
+
+            assert occupancy_targets.shape[:2] == (b, t)
+            occupancy_targets = rearrange(occupancy_targets, 'b t i -> (b t) i')
+
+        if exists(body_mask):
+            if body_mask.ndim == 2:
+                body_mask = repeat(body_mask, 'b i -> b t i', t = t)
+
+            assert body_mask.shape[:2] == (b, t)
+            body_mask = rearrange(body_mask, 'b t i -> (b t) i')
+
         out = self.attention(
             rearrange(context, 'b t d -> (b t) d'),
             rearrange(tokens, 'b t n d -> (b t) n d'),
             point_mask = point_mask,
             point_features = True,
-            occupancy_context = rearrange(terrain.context, 'b t d -> (b t) d')
+            occupancy_context = rearrange(terrain.context, 'b t d -> (b t) d'),
+            occupancy_targets = occupancy_targets,
+            body_mask = body_mask
         )
 
         return TerrainContactPlannerReturn(
@@ -569,5 +635,6 @@ class TerrainContactPlanner(Module):
             rearrange(out.occupancy_logits, '(b t) i -> b t i', b = b, t = t),
             rearrange(out.occupancy_probs, '(b t) i -> b t i', b = b, t = t),
             tokens,
-            terrain.context
+            terrain.context,
+            out.occupancy_loss
         )
