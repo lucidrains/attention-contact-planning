@@ -19,7 +19,7 @@ from torch.nn import Module
 import einx
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
-from torch_einops_utils import masked_mean
+from torch_einops_utils import masked_mean, masked_sum
 
 from x_mlps_pytorch import MLP
 
@@ -67,7 +67,7 @@ def contact_probs_loss(
     point_loss = -einsum(log_probs, soft_target_probs, 'b h i j, b i j -> b h i j')
 
     point_loss_mask = rearrange(point_mask, 'b j -> b 1 1 j') if exists(point_mask) else None
-    point_loss = masked_mean(point_loss, point_loss_mask, dim = -1)
+    point_loss = masked_sum(point_loss, point_loss_mask, dim = -1)
 
     return masked_mean(point_loss, rearrange(valid, 'b i -> b 1 i'))
 
