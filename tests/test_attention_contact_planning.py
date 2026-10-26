@@ -3,6 +3,7 @@ import torch
 
 from attention_contact_planning import (
     AttentionContactPlanning,
+    SelfAttention,
     TerrainContactPlanner,
     TerrainEncoder,
     contact_probs_loss,
@@ -87,6 +88,82 @@ def test_attention_planner_perceiver_body_to_terrain():
 
     assert len(planner.perceiver) == 2
     assert out.body_features.shape == (2, 9, 16)
+
+
+def test_self_attention_is_prenormed_with_residual():
+    torch.manual_seed(0)
+
+    attn = SelfAttention(dim = 16, heads = 4, dim_head = 4, depth = 2)
+    x = torch.randn(2, 10, 16)
+
+    assert attn(x).shape == x.shape
+
+    # zero out both residual branches -> identity
+
+    with torch.no_grad():
+        for self_attn, self_ff in attn.layers:
+            self_attn.fn.to_out.weight.zero_()
+            self_attn.fn.to_out.bias.zero_()
+            self_ff.fn.net[-2].weight.zero_()
+            self_ff.fn.net[-2].bias.zero_()
+
+    assert torch.allclose(attn(x), x)
+
+
+def test_self_attention_mask_ignores_masked_tokens():
+    torch.manual_seed(0)
+
+    attn = SelfAttention(dim = 16, heads = 4, dim_head = 4)
+    x = torch.randn(2, 10, 16)
+    mask = torch.ones(2, 10, dtype = torch.bool)
+    mask[0, 5:] = False
+
+    out = attn(x, mask = mask)
+
+    other_x = x.clone()
+    other_x[0, 5:] = torch.randn_like(other_x[0, 5:])
+
+    assert torch.allclose(out[0, :5], attn(other_x, mask = mask)[0, :5])
+
+
+@pytest.mark.parametrize('terrain_self_attend', [False, True])
+def test_optional_terrain_self_attention(terrain_self_attend):
+    torch.manual_seed(0)
+
+    planner = AttentionContactPlanning(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        point_dim = 16,
+        perceiver_depth = 1,
+        terrain_self_attend = terrain_self_attend,
+        terrain_self_attend_depth = 2
+    )
+
+    if terrain_self_attend:
+        assert len(planner.terrain_self_attn.layers) == 2
+    else:
+        assert planner.terrain_self_attn is None
+
+    context = torch.randn(2, 16)
+    points = torch.randn(2, 20, 16)
+    point_mask = torch.ones(2, 20, dtype = torch.bool)
+    point_mask[1, 10:] = False
+
+    out = planner(
+        context,
+        points,
+        point_mask = point_mask,
+        point_features = True
+    )
+
+    assert out.body_features.shape == (2, 9, 16)
+    assert (out.contact_probs[1, :, :, 11:] == 0).all()
+
+    out.attn_logits.mean().backward()
+
+    if terrain_self_attend:
+        assert any(param.grad is not None for param in planner.terrain_self_attn.parameters())
 
 
 @pytest.mark.parametrize('t', [1, 3])
@@ -258,6 +335,44 @@ def test_occupancy_derived_from_cross_attention():
 
     assert planner.to_body_with_context.weight.grad is not None
     assert planner.cross_attn.no_contact_key_value.grad is not None
+
+
+def test_terrain_planner_terrain_self_attend():
+    torch.manual_seed(0)
+
+    b, t, h, w = 2, 2, 3, 4
+    n = h * w
+
+    terrain_encoder = TerrainEncoder(dim = 16, context_dim = 8, channels = (4,))
+
+    planner = TerrainContactPlanner(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        terrain_encoder = terrain_encoder,
+        proprio_dim = 10,
+        goal_dim = 3,
+        terrain_self_attend = True,
+        terrain_self_attend_depth = 2
+    )
+
+    assert len(planner.attention.terrain_self_attn.layers) == 2
+
+    point_mask = torch.ones(b, t, n, dtype = torch.bool)
+    point_mask[:, :, 6:] = False
+
+    out = planner(
+        torch.randn(b, t, h, w),
+        torch.randn(b, t, n, 3),
+        torch.randn(b, t, 10),
+        torch.randn(b, t, 3),
+        point_mask = point_mask
+    )
+
+    assert out.body_features.shape == (b, t, 9, 16)
+
+    out.attn_logits.mean().backward()
+    assert any(param.grad is not None for param in planner.attention.terrain_self_attn.parameters())
 
 
 @pytest.mark.parametrize('occupancy_from_attention', [False, True])

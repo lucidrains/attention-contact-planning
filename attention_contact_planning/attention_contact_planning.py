@@ -18,6 +18,9 @@ import torch
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 from perceiver_pytorch import PerceiverBlock
+from perceiver_pytorch.perceiver_pytorch import Attention as PerceiverAttention
+from perceiver_pytorch.perceiver_pytorch import FeedForward as PerceiverFeedForward
+from perceiver_pytorch.perceiver_pytorch import PreNorm
 from torch import Tensor, nn
 from torch.nn import Module
 from torch.nn import functional as F
@@ -247,6 +250,37 @@ class FiLM(Module):
         scaled = einx.multiply('b ... d, b d -> b ... d', x, gamma + 1.)
         return einx.add('b ... d, b d -> b ... d', scaled, beta)
 
+class SelfAttention(Module):
+    """pre-norm self attention / feedforward stack borrowed from perceiver block"""
+
+    def __init__(
+        self,
+        dim,
+        heads = 8,
+        dim_head = 64,
+        depth = 1,
+        dropout = 0.
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                PreNorm(dim, PerceiverAttention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+                PreNorm(dim, PerceiverFeedForward(dim, dropout = dropout))
+            ])
+            for _ in range(depth)
+        ])
+
+    def forward(
+        self,
+        x: Tensor,
+        mask: Tensor | None = None
+    ) -> Tensor:
+        for self_attn, self_ff in self.layers:
+            x = self_attn(x, mask = mask) + x
+            x = self_ff(x) + x
+
+        return x
+
 class CrossAttention(Module):
     def __init__(
         self,
@@ -352,6 +386,8 @@ class AttentionContactPlanning(Module):
         dropout = 0.,
         perceiver_depth = 2,
         perceiver_queries_contribute_kv = True,
+        terrain_self_attend = False,
+        terrain_self_attend_depth = 1,
         occupancy_from_attention = False,
         occupancy_context_dim = None,
         occupancy_hidden_dims = (512, 512, 512)
@@ -373,6 +409,13 @@ class AttentionContactPlanning(Module):
             )
             for _ in range(perceiver_depth)
         ])
+        self.terrain_self_attn = SelfAttention(
+            dim = dim,
+            heads = heads,
+            dim_head = dim_head,
+            depth = terrain_self_attend_depth,
+            dropout = dropout
+        ) if terrain_self_attend else None
         self.cross_attn = CrossAttention(dim, heads, dim_head, point_dim, dropout)
 
         occupancy_context_dim = occupancy_context_dim if exists(occupancy_context_dim) else dim
@@ -402,6 +445,9 @@ class AttentionContactPlanning(Module):
 
         point_mask = point_mask.bool() if exists(point_mask) else None
         terrain_tokens = points if point_features else self.cross_attn.to_point(points)
+
+        if exists(self.terrain_self_attn):
+            terrain_tokens = self.terrain_self_attn(terrain_tokens, mask = point_mask)
 
         for block in self.perceiver:
             queries = block(queries, context = terrain_tokens, mask = point_mask)
@@ -443,6 +489,8 @@ class TerrainContactPlanner(Module):
         dropout = 0.,
         perceiver_depth = 2,
         perceiver_queries_contribute_kv = True,
+        terrain_self_attend = False,
+        terrain_self_attend_depth = 1,
         occupancy_from_attention = False,
         occupancy_hidden_dims = (512, 512, 512)
     ):
@@ -466,6 +514,8 @@ class TerrainContactPlanner(Module):
             dropout = dropout,
             perceiver_depth = perceiver_depth,
             perceiver_queries_contribute_kv = perceiver_queries_contribute_kv,
+            terrain_self_attend = terrain_self_attend,
+            terrain_self_attend_depth = terrain_self_attend_depth,
             occupancy_from_attention = occupancy_from_attention,
             occupancy_context_dim = self.terrain_encoder.context_dim,
             occupancy_hidden_dims = occupancy_hidden_dims
