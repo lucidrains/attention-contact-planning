@@ -37,10 +37,20 @@ TerrainEncoderReturn = namedtuple('TerrainEncoderReturn', [
     'context'
 ])
 
+AttentionContactPlanningReturn = namedtuple('AttentionContactPlanningReturn', [
+    'body_features',
+    'attn_logits',
+    'contact_probs',
+    'occupancy_logits',
+    'occupancy_probs'
+])
+
 TerrainContactPlannerReturn = namedtuple('TerrainContactPlannerReturn', [
     'body_features',
     'attn_logits',
     'contact_probs',
+    'occupancy_logits',
+    'occupancy_probs',
     'terrain_tokens',
     'terrain_context'
 ])
@@ -114,6 +124,19 @@ def contact_probs_loss(
 
     valid = contact_mask.bool() if exists(contact_mask) else torch.ones_like(no_contact_target, dtype = torch.bool)
     return masked_mean(point_loss, rearrange(valid, 'b i -> b 1 i'))
+
+def occupancy_loss(
+    occupancy_logits: Tensor,   # b i
+    occupancy_targets: Tensor,  # b i
+    body_mask: Tensor | None = None
+) -> Tensor:
+    loss = F.binary_cross_entropy_with_logits(
+        occupancy_logits,
+        occupancy_targets.float(),
+        reduction = 'none'
+    )
+
+    return masked_mean(loss, body_mask.bool()) if exists(body_mask) else loss.mean()
 
 # modules
 
@@ -300,6 +323,24 @@ class CrossAttention(Module):
 
         return CrossAttentionReturn(body_features, attn_logits, contact_probs)
 
+class OccupancyPredictor(Module):
+    def __init__(
+        self,
+        dim,
+        context_dim,
+        hidden_dims = (512, 512, 512)
+    ):
+        super().__init__()
+        self.net = MLP(dim + context_dim, *hidden_dims, 1, squeeze_out = True)
+
+    def forward(
+        self,
+        body_features: Tensor,  # b i d
+        context: Tensor          # b c
+    ) -> Tensor:                # b i
+        context = repeat(context, 'b c -> b i c', i = body_features.shape[-2])
+        return self.net(torch.cat((body_features, context), dim = -1))
+
 class AttentionContactPlanning(Module):
     def __init__(
         self,
@@ -310,7 +351,10 @@ class AttentionContactPlanning(Module):
         num_bodies = 9,
         dropout = 0.,
         perceiver_depth = 2,
-        perceiver_queries_contribute_kv = True
+        perceiver_queries_contribute_kv = True,
+        occupancy_from_attention = False,
+        occupancy_context_dim = None,
+        occupancy_hidden_dims = (512, 512, 512)
     ):
         super().__init__()
         self.body_embed = nn.Parameter(torch.randn(num_bodies, dim) * 0.02)
@@ -331,14 +375,29 @@ class AttentionContactPlanning(Module):
         ])
         self.cross_attn = CrossAttention(dim, heads, dim_head, point_dim, dropout)
 
+        occupancy_context_dim = occupancy_context_dim if exists(occupancy_context_dim) else dim
+
+        # occupancy - faithful: mlp on cross attention output + pooled terrain context
+        # or single source - fold context into body query upfront, occupancy is just 1 - no-contact prob
+        self.occupancy_from_attention = occupancy_from_attention
+        self.to_body_with_context = nn.Linear(dim + occupancy_context_dim, dim) if occupancy_from_attention else None
+        self.occupancy_predictor = None if occupancy_from_attention else OccupancyPredictor(dim, occupancy_context_dim, occupancy_hidden_dims)
+
     def forward(
         self,
-        context: Tensor,                  # b d
-        points: Tensor,                   # b j point_dim | b j d
-        point_mask: Tensor | None = None, # b j
-        point_features: bool = False
-    ) -> CrossAttentionReturn:
+        context: Tensor,                    # b d
+        points: Tensor,                     # b j point_dim | b j d
+        point_mask: Tensor | None = None,   # b j
+        point_features: bool = False,
+        occupancy_context: Tensor | None = None # b c
+    ) -> AttentionContactPlanningReturn:
         body_embed = repeat(self.body_embed, 'i d -> b i d', b = context.shape[0])
+        occupancy_context = occupancy_context if exists(occupancy_context) else context
+
+        if exists(self.to_body_with_context):
+            body_context = repeat(occupancy_context, 'b c -> b i c', i = self.body_embed.shape[0])
+            body_embed = self.to_body_with_context(torch.cat((body_embed, body_context), dim = -1))
+
         queries = self.film(body_embed, context)
 
         point_mask = point_mask.bool() if exists(point_mask) else None
@@ -347,11 +406,27 @@ class AttentionContactPlanning(Module):
         for block in self.perceiver:
             queries = block(queries, context = terrain_tokens, mask = point_mask)
 
-        return self.cross_attn(
+        out = self.cross_attn(
             queries,
             terrain_tokens,
             point_mask = point_mask,
             point_features = True
+        )
+
+        if self.occupancy_from_attention:
+            no_contact_probs = out.contact_probs[..., 0].mean(dim = 1) # b h i -> b i
+            occupancy_probs = 1. - no_contact_probs
+            occupancy_logits = occupancy_probs.clamp(1e-6, 1. - 1e-6).logit()
+        else:
+            occupancy_logits = self.occupancy_predictor(out.body_features, occupancy_context)
+            occupancy_probs = occupancy_logits.sigmoid()
+
+        return AttentionContactPlanningReturn(
+            out.body_features,
+            out.attn_logits,
+            out.contact_probs,
+            occupancy_logits,
+            occupancy_probs
         )
 
 class TerrainContactPlanner(Module):
@@ -367,7 +442,9 @@ class TerrainContactPlanner(Module):
         context_hidden_dim = 128,
         dropout = 0.,
         perceiver_depth = 2,
-        perceiver_queries_contribute_kv = True
+        perceiver_queries_contribute_kv = True,
+        occupancy_from_attention = False,
+        occupancy_hidden_dims = (512, 512, 512)
     ):
         super().__init__()
         self.terrain_encoder = terrain_encoder if exists(terrain_encoder) else TerrainEncoder(dim = dim)
@@ -388,7 +465,10 @@ class TerrainContactPlanner(Module):
             num_bodies = num_bodies,
             dropout = dropout,
             perceiver_depth = perceiver_depth,
-            perceiver_queries_contribute_kv = perceiver_queries_contribute_kv
+            perceiver_queries_contribute_kv = perceiver_queries_contribute_kv,
+            occupancy_from_attention = occupancy_from_attention,
+            occupancy_context_dim = self.terrain_encoder.context_dim,
+            occupancy_hidden_dims = occupancy_hidden_dims
         )
 
     def forward(
@@ -428,13 +508,16 @@ class TerrainContactPlanner(Module):
             rearrange(context, 'b t d -> (b t) d'),
             rearrange(tokens, 'b t n d -> (b t) n d'),
             point_mask = point_mask,
-            point_features = True
+            point_features = True,
+            occupancy_context = rearrange(terrain.context, 'b t d -> (b t) d')
         )
 
         return TerrainContactPlannerReturn(
             rearrange(out.body_features, '(b t) i d -> b t i d', b = b, t = t),
             rearrange(out.attn_logits, '(b t) h i j -> b t h i j', b = b, t = t),
             rearrange(out.contact_probs, '(b t) h i j -> b t h i j', b = b, t = t),
+            rearrange(out.occupancy_logits, '(b t) i -> b t i', b = b, t = t),
+            rearrange(out.occupancy_probs, '(b t) i -> b t i', b = b, t = t),
             tokens,
             terrain.context
         )

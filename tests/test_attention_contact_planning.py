@@ -1,6 +1,14 @@
+import pytest
 import torch
 
-from attention_contact_planning import AttentionContactPlanning, contact_probs_loss
+from attention_contact_planning import (
+    AttentionContactPlanning,
+    TerrainContactPlanner,
+    TerrainEncoder,
+    contact_probs_loss,
+    no_contact_target_from_soft_targets,
+    occupancy_loss,
+)
 
 
 def test_attention_contact_planning():
@@ -31,3 +39,263 @@ def test_attention_contact_planning():
 
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+
+
+def test_blank_soft_target_sets_no_contact_to_one():
+    soft_target_probs = torch.zeros(2, 3, 5)
+    soft_target_probs[1, 0, 2] = 1.
+
+    no_contact_target = no_contact_target_from_soft_targets(soft_target_probs)
+
+    assert no_contact_target.tolist() == [
+        [1., 1., 1.],
+        [0., 1., 1.],
+    ]
+
+    # mass only on a masked point also counts as blank
+
+    point_mask = torch.ones(2, 5, dtype = torch.bool)
+    point_mask[1, 2] = False
+
+    masked_no_contact_target = no_contact_target_from_soft_targets(
+        soft_target_probs,
+        point_mask = point_mask
+    )
+
+    assert masked_no_contact_target[1, 0] == 1.
+
+    # no-contact logit is column 0
+
+    attn_logits = torch.zeros(2, 1, 3, 6, requires_grad = True)
+
+    loss = contact_probs_loss(attn_logits, soft_target_probs)
+    loss.backward()
+
+    assert attn_logits.grad is not None
+    assert attn_logits.grad[1, 0, 0, 0] > 0.  # valid contact
+    assert attn_logits.grad[1, 0, 1, 0] < 0.  # blank target
+
+
+def test_attention_planner_perceiver_body_to_terrain():
+    planner = AttentionContactPlanning(dim = 16, heads = 4, dim_head = 4, point_dim = 16)
+
+    out = planner(
+        torch.randn(2, 16),
+        torch.randn(2, 30, 16),
+        point_features = True
+    )
+
+    assert len(planner.perceiver) == 2
+    assert out.body_features.shape == (2, 9, 16)
+
+
+@pytest.mark.parametrize('t', [1, 3])
+def test_terrain_encoder_to_cross_attention(t):
+    # height scans -> terrain tokens + context -> query context -> cross attention
+
+    torch.manual_seed(0)
+
+    b, h, w = 2, 17, 11
+    n = h * w
+
+    terrain_encoder = TerrainEncoder() if t == 1 else TerrainEncoder(kernel_size = (3, 5, 5))
+
+    planner = TerrainContactPlanner(
+        terrain_encoder = terrain_encoder,
+        proprio_dim = 10,
+        goal_dim = 3
+    )
+
+    height = torch.randn(b, t, h, w)
+    points = torch.randn(b, t, n, 3)
+    proprio = torch.randn(b, t, 10)
+    goal = torch.randn(b, t, 3)
+
+    out = planner(height, points, proprio, goal)
+
+    assert out.terrain_tokens.shape == (b, t, n, 96)
+    assert out.terrain_context.shape == (b, t, 64)
+    assert out.body_features.shape == (b, t, 9, 96)
+    assert out.attn_logits.shape == (b, t, 32, 9, n + 1)
+    assert out.contact_probs.shape == (b, t, 32, 9, n + 1)
+    assert torch.allclose(out.contact_probs, out.attn_logits.softmax(dim = -1))
+
+    # changing the future must not change past terrain features
+
+    if t > 1:
+        future = height.clone()
+        future[:, -1] += 1.
+
+        tokens = planner.terrain_encoder(height, points).tokens
+        future_tokens = planner.terrain_encoder(future, points).tokens
+
+        assert torch.allclose(tokens[:, :-1], future_tokens[:, :-1])
+
+    target = torch.randn(b, t, 9, n).softmax(dim = -1)
+    target[:, :, 6:] = 0.  # blank maps become no-contact targets
+
+    loss = contact_probs_loss(
+        out.attn_logits.reshape(b * t, 32, 9, n + 1),
+        target.reshape(b * t, 9, n)
+    )
+
+    loss.backward()
+
+    assert planner.terrain_encoder.convs[0].conv.weight.grad is not None
+    assert planner.attention.body_embed.grad is not None
+    assert planner.attention.cross_attn.no_contact_key_value.grad is not None
+
+    assert len(planner.attention.perceiver) == 2
+    assert any(param.grad is not None for param in planner.attention.perceiver.parameters())
+
+
+def make_planner(occupancy_from_attention):
+    return AttentionContactPlanning(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        point_dim = 16,
+        num_bodies = 9,
+        occupancy_from_attention = occupancy_from_attention,
+        occupancy_context_dim = 8,
+        occupancy_hidden_dims = (32, 32)
+    )
+
+
+def test_occupancy_head_faithful_to_paper():
+    torch.manual_seed(0)
+
+    b, n, dim, context_dim, num_bodies = 2, 20, 16, 8, 9
+
+    planner = make_planner(occupancy_from_attention = False)
+
+    assert planner.occupancy_predictor is not None
+    assert planner.to_body_with_context is None
+
+    context = torch.randn(b, dim)
+    occupancy_context = torch.randn(b, context_dim)
+    points = torch.randn(b, n, dim)
+
+    out = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = occupancy_context
+    )
+
+    assert out.occupancy_logits.shape == (b, num_bodies)
+    assert out.occupancy_probs.shape == (b, num_bodies)
+    assert torch.allclose(out.occupancy_probs, out.occupancy_logits.sigmoid())
+
+    # head must see the pooled terrain context
+
+    other = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = torch.randn(b, context_dim)
+    )
+
+    assert not torch.allclose(out.occupancy_logits, other.occupancy_logits)
+
+    targets = torch.randint(0, 2, (b, num_bodies)).float()
+    loss = occupancy_loss(out.occupancy_logits, targets)
+
+    loss.backward()
+
+    assert any(param.grad is not None for param in planner.occupancy_predictor.parameters())
+    assert planner.body_embed.grad is not None
+
+
+def test_occupancy_derived_from_cross_attention():
+    torch.manual_seed(0)
+
+    b, n, dim, context_dim, num_bodies = 2, 20, 16, 8, 9
+
+    planner = make_planner(occupancy_from_attention = True)
+
+    assert planner.occupancy_predictor is None
+    assert planner.to_body_with_context is not None
+
+    context = torch.randn(b, dim)
+    occupancy_context = torch.randn(b, context_dim)
+    points = torch.randn(b, n, dim)
+
+    out = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = occupancy_context
+    )
+
+    # occupancy is just the no-contact column, averaged over heads
+
+    expected_occupancy = 1. - out.contact_probs[..., 0].mean(dim = 1)
+
+    assert out.occupancy_probs.shape == (b, num_bodies)
+    assert torch.allclose(out.occupancy_probs, expected_occupancy)
+    assert torch.allclose(
+        out.occupancy_logits,
+        expected_occupancy.clamp(1e-6, 1. - 1e-6).logit()
+    )
+
+    # context is folded in early, so body features and occupancy both move
+
+    other = planner(
+        context,
+        points,
+        point_features = True,
+        occupancy_context = torch.randn(b, context_dim)
+    )
+
+    assert not torch.allclose(out.body_features, other.body_features)
+    assert not torch.allclose(out.occupancy_probs, other.occupancy_probs)
+
+    targets = torch.randint(0, 2, (b, num_bodies)).float()
+    loss = occupancy_loss(out.occupancy_logits, targets)
+
+    loss.backward()
+
+    assert planner.to_body_with_context.weight.grad is not None
+    assert planner.cross_attn.no_contact_key_value.grad is not None
+
+
+@pytest.mark.parametrize('occupancy_from_attention', [False, True])
+def test_terrain_planner_occupancy(occupancy_from_attention):
+    torch.manual_seed(0)
+
+    b, t, h, w = 2, 2, 3, 4
+    n = h * w
+
+    terrain_encoder = TerrainEncoder(dim = 16, context_dim = 8, channels = (4,))
+
+    planner = TerrainContactPlanner(
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        terrain_encoder = terrain_encoder,
+        proprio_dim = 10,
+        goal_dim = 3,
+        occupancy_from_attention = occupancy_from_attention,
+        occupancy_hidden_dims = (16,)
+    )
+
+    out = planner(
+        torch.randn(b, t, h, w),
+        torch.randn(b, t, n, 3),
+        torch.randn(b, t, 10),
+        torch.randn(b, t, 3)
+    )
+
+    assert out.occupancy_logits.shape == (b, t, 9)
+    assert out.occupancy_probs.shape == (b, t, 9)
+
+    if occupancy_from_attention:
+        assert planner.attention.occupancy_predictor is None
+        expected = 1. - out.contact_probs[..., 0].mean(dim = 2)
+        assert torch.allclose(out.occupancy_probs, expected)
+    else:
+        assert planner.attention.occupancy_predictor is not None
+
+    out.occupancy_logits.mean().backward()
+    assert planner.terrain_encoder.convs[0].conv.weight.grad is not None
