@@ -17,6 +17,7 @@ import einx
 import torch
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
+from perceiver_pytorch import PerceiverBlock
 from torch import Tensor, nn
 from torch.nn import Module
 from torch.nn import functional as F
@@ -307,11 +308,27 @@ class AttentionContactPlanning(Module):
         dim_head = 3,
         point_dim = 3,
         num_bodies = 9,
-        dropout = 0.
+        dropout = 0.,
+        perceiver_depth = 2,
+        perceiver_queries_contribute_kv = True
     ):
         super().__init__()
         self.body_embed = nn.Parameter(torch.randn(num_bodies, dim) * 0.02)
         self.film = FiLM(dim)
+        self.perceiver = nn.ModuleList([
+            PerceiverBlock(
+                dim = dim,
+                context_dim = dim,
+                cross_heads = 1,
+                latent_heads = heads,
+                cross_dim_head = 64,
+                latent_dim_head = dim_head,
+                attn_dropout = dropout,
+                ff_dropout = dropout,
+                queries_contribute_kv = perceiver_queries_contribute_kv
+            )
+            for _ in range(perceiver_depth)
+        ])
         self.cross_attn = CrossAttention(dim, heads, dim_head, point_dim, dropout)
 
     def forward(
@@ -324,11 +341,17 @@ class AttentionContactPlanning(Module):
         body_embed = repeat(self.body_embed, 'i d -> b i d', b = context.shape[0])
         queries = self.film(body_embed, context)
 
+        point_mask = point_mask.bool() if exists(point_mask) else None
+        terrain_tokens = points if point_features else self.cross_attn.to_point(points)
+
+        for block in self.perceiver:
+            queries = block(queries, context = terrain_tokens, mask = point_mask)
+
         return self.cross_attn(
             queries,
-            points,
+            terrain_tokens,
             point_mask = point_mask,
-            point_features = point_features
+            point_features = True
         )
 
 class TerrainContactPlanner(Module):
@@ -342,7 +365,9 @@ class TerrainContactPlanner(Module):
         goal_dim = 3,
         terrain_encoder: TerrainEncoder | None = None,
         context_hidden_dim = 128,
-        dropout = 0.
+        dropout = 0.,
+        perceiver_depth = 2,
+        perceiver_queries_contribute_kv = True
     ):
         super().__init__()
         self.terrain_encoder = terrain_encoder if exists(terrain_encoder) else TerrainEncoder(dim = dim)
@@ -361,7 +386,9 @@ class TerrainContactPlanner(Module):
             dim_head = dim_head,
             point_dim = dim,
             num_bodies = num_bodies,
-            dropout = dropout
+            dropout = dropout,
+            perceiver_depth = perceiver_depth,
+            perceiver_queries_contribute_kv = perceiver_queries_contribute_kv
         )
 
     def forward(
