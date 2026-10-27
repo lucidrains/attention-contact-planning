@@ -3,6 +3,7 @@ import torch
 
 from attention_contact_planning import (
     AttentionContactPlanning,
+    ContactPlannerWithOutcomeModel,
     CrossAttention,
     TerrainContactPlanner,
     TerrainEncoder,
@@ -568,3 +569,69 @@ def test_terrain_planner_optional_occupancy_loss_from_labels():
 
     out.occupancy_loss.backward()
     assert exists(planner.terrain_encoder.convs[0].conv.weight.grad)
+
+
+@pytest.mark.parametrize('outcome_model, tie_outcome_model', [
+    (False, False),
+    (True, False),
+    (True, True)
+])
+def test_contact_planner_with_outcome_model(outcome_model, tie_outcome_model):
+    torch.manual_seed(0)
+
+    b, t, h, w = 2, 2, 3, 4
+    n, num_bodies = h * w, 9
+
+    planner = ContactPlannerWithOutcomeModel(
+        action_dim = 6,
+        outcome_model = outcome_model,
+        tie_outcome_model = tie_outcome_model,
+        dim = 16,
+        heads = 4,
+        dim_head = 4,
+        terrain_encoder = TerrainEncoder(dim = 16, context_dim = 8, channels = (4,)),
+        proprio_dim = 10,
+        goal_dim = 3,
+        context_hidden_dim = 16,
+        occupancy_hidden_dims = (16,)
+    )
+
+    height = torch.randn(b, t, h, w)
+    points = torch.randn(b, t, n, 3)
+    proprio = torch.randn(b, t, 10)
+    goal = torch.randn(b, t, 3)
+    prev_action = torch.randn(b, t, 6)
+    action = torch.randn(b, t, 6) if outcome_model else None
+
+    out = planner(
+        height, points, proprio, goal,
+        prev_action = prev_action,
+        action = action,
+        occupancy_targets = torch.randint(0, 2, (b, t, num_bodies)).float(),
+        contact_targets = torch.randn(b, num_bodies, n).softmax(dim = -1)
+    )
+
+    assert out.plan.contact_probs.shape == (b, t, 4, num_bodies, n + 1)
+    assert exists(out.plan.contact_loss)
+
+    if not outcome_model:
+        assert not exists(out.outcome_model)
+        assert not exists(out.aux_loss)
+
+        with pytest.raises(AssertionError):
+            planner(height, points, proprio, goal, prev_action = prev_action, action = torch.randn(b, t, 6))
+
+        return
+
+    assert out.outcome_model.contact_probs.shape == (b, t, 4, num_bodies, n + 1)
+    assert exists(out.aux_loss)
+
+    if tie_outcome_model:
+        assert planner.outcome_model is planner.planner
+    else:
+        assert planner.outcome_model is not planner.planner
+
+    with pytest.raises(AssertionError):
+        planner(height, points, proprio, goal, prev_action = prev_action)
+
+    out.aux_loss.backward()

@@ -58,7 +58,14 @@ TerrainContactPlannerReturn = namedtuple('TerrainContactPlannerReturn', [
     'occupancy_probs',
     'terrain_tokens',
     'terrain_context',
-    'occupancy_loss'
+    'occupancy_loss',
+    'contact_loss'
+])
+
+ContactPlannerWithOutcomeModelReturn = namedtuple('ContactPlannerWithOutcomeModelReturn', [
+    'plan',
+    'outcome_model',
+    'aux_loss'
 ])
 
 # helpers
@@ -528,6 +535,7 @@ class TerrainContactPlanner(Module):
         num_bodies = 9,
         proprio_dim = 375,
         goal_dim = 3,
+        action_dim = 0,
         terrain_encoder: TerrainEncoder | None = None,
         context_hidden_dim = 128,
         dropout = 0.,
@@ -544,8 +552,10 @@ class TerrainContactPlanner(Module):
         self.terrain_encoder = terrain_encoder if exists(terrain_encoder) else TerrainEncoder(dim = dim)
         assert self.terrain_encoder.dim == dim
 
+        self.action_dim = action_dim
+
         self.to_context = MLP(
-            proprio_dim + goal_dim + self.terrain_encoder.context_dim,
+            proprio_dim + goal_dim + action_dim + self.terrain_encoder.context_dim,
             context_hidden_dim,
             context_hidden_dim,
             dim
@@ -575,15 +585,21 @@ class TerrainContactPlanner(Module):
         points: Tensor,                  # b t n 3 | b n 3
         proprio: Tensor,                 # b t d | b d
         goal: Tensor,                    # b t d | b d
+        action: Tensor | None = None,    # b t action_dim | b action_dim
         point_mask: Tensor | None = None, # b t n | b n
         occupancy_targets: Tensor | None = None, # b t i | b i
-        body_mask: Tensor | None = None # b t i | b i
+        body_mask: Tensor | None = None, # b t i | b i
+        contact_targets: Tensor | None = None, # b t i j | b i j
+        contact_mask: Tensor | None = None # b t i | b i
     ) -> TerrainContactPlannerReturn:
         if proprio.ndim == 2:
             proprio = rearrange(proprio, 'b d -> b 1 d')
 
         if goal.ndim == 2:
             goal = rearrange(goal, 'b d -> b 1 d')
+
+        if exists(action) and action.ndim == 2:
+            action = rearrange(action, 'b d -> b 1 d')
 
         terrain = self.terrain_encoder(height, points, point_mask)
         tokens = terrain.tokens
@@ -593,7 +609,18 @@ class TerrainContactPlanner(Module):
         assert proprio.shape[:2] == (b, t)
         assert goal.shape[:2] == (b, t)
 
-        context = self.to_context(torch.cat((proprio, goal, terrain.context), dim = -1))
+        if self.action_dim > 0:
+            assert exists(action), 'action must be passed when action_dim > 0'
+
+            assert action.shape[:2] == (b, t)
+            assert action.shape[-1] == self.action_dim
+
+            context_input = torch.cat((proprio, goal, action, terrain.context), dim = -1)
+        else:
+            assert not exists(action), 'set action_dim > 0 to condition on action'
+            context_input = torch.cat((proprio, goal, terrain.context), dim = -1)
+
+        context = self.to_context(context_input)
 
         if exists(point_mask):
             if point_mask.ndim == 2:
@@ -618,6 +645,20 @@ class TerrainContactPlanner(Module):
             assert body_mask.shape[:2] == (b, t)
             body_mask = rearrange(body_mask, 'b t i -> (b t) i')
 
+        if exists(contact_targets):
+            if contact_targets.ndim == 3:
+                contact_targets = repeat(contact_targets, 'b i j -> b t i j', t = t)
+
+            assert contact_targets.ndim == 4 and contact_targets.shape[:2] == (b, t)
+            contact_targets = rearrange(contact_targets, 'b t i j -> (b t) i j')
+
+        if exists(contact_mask):
+            if contact_mask.ndim == 2:
+                contact_mask = repeat(contact_mask, 'b i -> b t i', t = t)
+
+            assert contact_mask.shape[:2] == (b, t)
+            contact_mask = rearrange(contact_mask, 'b t i -> (b t) i')
+
         out = self.attention(
             rearrange(context, 'b t d -> (b t) d'),
             rearrange(tokens, 'b t n d -> (b t) n d'),
@@ -628,6 +669,8 @@ class TerrainContactPlanner(Module):
             body_mask = body_mask
         )
 
+        contact_loss = contact_probs_loss(out.attn_logits, contact_targets, point_mask, contact_mask) if exists(contact_targets) else None
+
         return TerrainContactPlannerReturn(
             rearrange(out.body_features, '(b t) i d -> b t i d', b = b, t = t),
             rearrange(out.attn_logits, '(b t) h i j -> b t h i j', b = b, t = t),
@@ -636,5 +679,93 @@ class TerrainContactPlanner(Module):
             rearrange(out.occupancy_probs, '(b t) i -> b t i', b = b, t = t),
             tokens,
             terrain.context,
-            out.occupancy_loss
+            out.occupancy_loss,
+            contact_loss
         )
+
+class ContactPlannerWithOutcomeModel(Module):
+    """contact planner on past action, with an optional action-conditioned contact outcome model"""
+
+    def __init__(
+        self,
+        *,
+        action_dim,
+        outcome_model = False,
+        tie_outcome_model = False,
+        **planner_kwargs
+    ):
+        super().__init__()
+        assert not tie_outcome_model or outcome_model, 'tie_outcome_model requires outcome_model = True'
+
+        terrain_encoder = planner_kwargs.pop('terrain_encoder', None)
+
+        self.planner = TerrainContactPlanner(
+            action_dim = action_dim,
+            terrain_encoder = terrain_encoder,
+            **planner_kwargs
+        )
+
+        self.outcome_model = None if not outcome_model else (
+            self.planner if tie_outcome_model else TerrainContactPlanner(
+                action_dim = action_dim,
+                terrain_encoder = self.planner.terrain_encoder,
+                **planner_kwargs
+            )
+        )
+
+    def forward(
+        self,
+        height: Tensor,
+        points: Tensor,
+        proprio: Tensor,
+        goal: Tensor,
+        prev_action: Tensor,
+        action: Tensor | None = None,
+        point_mask: Tensor | None = None,
+        occupancy_targets: Tensor | None = None,
+        body_mask: Tensor | None = None,
+        contact_targets: Tensor | None = None,
+        contact_mask: Tensor | None = None
+    ) -> ContactPlannerWithOutcomeModelReturn:
+        if exists(action):
+            assert exists(self.outcome_model), 'enable outcome_model to pass action'
+        else:
+            assert not exists(self.outcome_model), 'action must be passed when outcome_model is enabled'
+
+        plan = self.planner(
+            height,
+            points,
+            proprio,
+            goal,
+            action = prev_action,
+            point_mask = point_mask,
+            occupancy_targets = occupancy_targets,
+            body_mask = body_mask,
+            contact_targets = contact_targets,
+            contact_mask = contact_mask
+        )
+
+        if not exists(self.outcome_model):
+            return ContactPlannerWithOutcomeModelReturn(plan, None, None)
+
+        outcome_out = self.outcome_model(
+            height,
+            points,
+            proprio,
+            goal,
+            action = action,
+            point_mask = point_mask,
+            occupancy_targets = occupancy_targets,
+            body_mask = body_mask,
+            contact_targets = contact_targets,
+            contact_mask = contact_mask
+        )
+
+        losses = [
+            loss for loss in (outcome_out.occupancy_loss, outcome_out.contact_loss)
+            if exists(loss)
+        ]
+
+        aux_loss = sum(losses) if losses else None
+
+        return ContactPlannerWithOutcomeModelReturn(plan, outcome_out, aux_loss)
