@@ -617,6 +617,7 @@ def test_contact_planner_with_outcome_model(outcome_model, tie_outcome_model):
     if not outcome_model:
         assert not exists(out.outcome_model)
         assert not exists(out.aux_loss)
+        assert not planner.planner.attention.film_timestep_cond
 
         with pytest.raises(AssertionError):
             planner(height, points, proprio, goal, prev_action = prev_action, action = torch.randn(b, t, 6))
@@ -628,8 +629,10 @@ def test_contact_planner_with_outcome_model(outcome_model, tie_outcome_model):
 
     if tie_outcome_model:
         assert planner.outcome_model is planner.planner
+        assert planner.planner.attention.film_timestep_cond
     else:
         assert planner.outcome_model is not planner.planner
+        assert not planner.planner.attention.film_timestep_cond
 
     with pytest.raises(AssertionError):
         planner(height, points, proprio, goal, prev_action = prev_action)

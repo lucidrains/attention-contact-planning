@@ -250,10 +250,12 @@ class FiLM(Module):
     def __init__(
         self,
         dim,
-        hidden_dim = 64
+        hidden_dim = 64,
+        cond_dim = None
     ):
         super().__init__()
-        self.to_gamma_beta = MLP(dim, hidden_dim, dim * 2)
+        cond_dim = cond_dim if exists(cond_dim) else dim
+        self.to_gamma_beta = MLP(cond_dim, hidden_dim, dim * 2)
 
     def forward(self, x, cond):
         gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
@@ -428,11 +430,13 @@ class AttentionContactPlanning(Module):
         occupancy_context_dim = None,
         occupancy_hidden_dims = (512, 512, 512),
         talking_heads = True,
-        talking_heads_hidden_dim = 8
+        talking_heads_hidden_dim = 8,
+        film_timestep_cond = False
     ):
         super().__init__()
         self.body_embed = nn.Parameter(torch.randn(num_bodies, dim) * 0.02)
-        self.film = FiLM(dim)
+        self.film_timestep_cond = film_timestep_cond
+        self.film = FiLM(dim, cond_dim = dim + 1 if film_timestep_cond else dim) # +1 for past / present flag
         self.perceiver = nn.ModuleList([
             PerceiverBlock(
                 dim = dim,
@@ -480,7 +484,8 @@ class AttentionContactPlanning(Module):
         point_features: bool = False,
         occupancy_context: Tensor | None = None, # b c
         occupancy_targets: Tensor | None = None, # b i
-        body_mask: Tensor | None = None # b i
+        body_mask: Tensor | None = None, # b i
+        is_current_timestep: Tensor | bool = False # b | scalar, 1 being present
     ) -> AttentionContactPlanningReturn:
         body_embed = repeat(self.body_embed, 'i d -> b i d', b = context.shape[0])
         occupancy_context = occupancy_context if exists(occupancy_context) else context
@@ -489,7 +494,14 @@ class AttentionContactPlanning(Module):
             body_context = repeat(occupancy_context, 'b c -> b i c', i = self.body_embed.shape[0])
             body_embed = self.to_body_with_context(torch.cat((body_embed, body_context), dim = -1))
 
-        queries = self.film(body_embed, context)
+        film_cond = context
+
+        if self.film_timestep_cond:
+            is_current = torch.as_tensor(is_current_timestep, device = context.device, dtype = context.dtype)
+            is_current = repeat(is_current, '-> b', b = context.shape[0]) if is_current.ndim == 0 else is_current
+            film_cond = torch.cat((context, rearrange(is_current, 'b -> b 1')), dim = -1)
+
+        queries = self.film(body_embed, film_cond)
 
         point_mask = point_mask.bool() if exists(point_mask) else None
         terrain_tokens = points if point_features else self.cross_attn.to_point(points)
@@ -546,7 +558,8 @@ class TerrainContactPlanner(Module):
         occupancy_from_attention = False,
         occupancy_hidden_dims = (512, 512, 512),
         talking_heads = True,
-        talking_heads_hidden_dim = 8
+        talking_heads_hidden_dim = 8,
+        film_timestep_cond = False
     ):
         super().__init__()
         self.terrain_encoder = terrain_encoder if exists(terrain_encoder) else TerrainEncoder(dim = dim)
@@ -576,7 +589,8 @@ class TerrainContactPlanner(Module):
             occupancy_context_dim = self.terrain_encoder.context_dim,
             occupancy_hidden_dims = occupancy_hidden_dims,
             talking_heads = talking_heads,
-            talking_heads_hidden_dim = talking_heads_hidden_dim
+            talking_heads_hidden_dim = talking_heads_hidden_dim,
+            film_timestep_cond = film_timestep_cond
         )
 
     def forward(
@@ -590,7 +604,8 @@ class TerrainContactPlanner(Module):
         occupancy_targets: Tensor | None = None, # b t i | b i
         body_mask: Tensor | None = None, # b t i | b i
         contact_targets: Tensor | None = None, # b t i j | b i j
-        contact_mask: Tensor | None = None # b t i | b i
+        contact_mask: Tensor | None = None, # b t i | b i
+        is_current_timestep: Tensor | bool = False # b | scalar, 1 being present
     ) -> TerrainContactPlannerReturn:
         if proprio.ndim == 2:
             proprio = rearrange(proprio, 'b d -> b 1 d')
@@ -666,7 +681,8 @@ class TerrainContactPlanner(Module):
             point_features = True,
             occupancy_context = rearrange(terrain.context, 'b t d -> (b t) d'),
             occupancy_targets = occupancy_targets,
-            body_mask = body_mask
+            body_mask = body_mask,
+            is_current_timestep = is_current_timestep
         )
 
         contact_loss = contact_probs_loss(out.attn_logits, contact_targets, point_mask, contact_mask) if exists(contact_targets) else None
@@ -698,6 +714,8 @@ class ContactPlannerWithOutcomeModel(Module):
         assert not tie_outcome_model or outcome_model, 'tie_outcome_model requires outcome_model = True'
 
         terrain_encoder = planner_kwargs.pop('terrain_encoder', None)
+
+        planner_kwargs.setdefault('film_timestep_cond', outcome_model and tie_outcome_model)
 
         self.planner = TerrainContactPlanner(
             action_dim = action_dim,
@@ -742,7 +760,8 @@ class ContactPlannerWithOutcomeModel(Module):
             occupancy_targets = occupancy_targets,
             body_mask = body_mask,
             contact_targets = contact_targets,
-            contact_mask = contact_mask
+            contact_mask = contact_mask,
+            is_current_timestep = False
         )
 
         if not exists(self.outcome_model):
@@ -758,7 +777,8 @@ class ContactPlannerWithOutcomeModel(Module):
             occupancy_targets = occupancy_targets,
             body_mask = body_mask,
             contact_targets = contact_targets,
-            contact_mask = contact_mask
+            contact_mask = contact_mask,
+            is_current_timestep = True
         )
 
         losses = [
